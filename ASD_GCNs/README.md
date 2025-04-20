@@ -4,4 +4,4 @@
 
 自行创建results文件夹
 
-<p align='right'>仅做项目草稿保存，shishan代码以后改</p>
+<p align='right'>仅做项目草稿保存，shishan代码以后再改</p>
