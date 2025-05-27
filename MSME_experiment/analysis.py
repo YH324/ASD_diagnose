@@ -31,84 +31,60 @@ def save_figure(fig, path, dpi=300):
     plt.close(fig)
 
 ANATOMICAL_LABELS = {
-    0: "Frontal Lobe", # 例如: 额叶
-    1: "Occipital Lobe",# 例如: 顶叶
-    2: "Parietal Lobe",# 例如: 颞叶
-    3: "Prefontal Lobe",# 例如: 枕叶
-    4: "Subcortical Lobe",  # 例如: 边缘叶
-    5: "Temporal" # 例如: 小脑和脑干
+    0: "Frontal Lobe",
+    1: "Occipital Lobe",
+    2: "Parietal Lobe",
+    3: "Prefontal Lobe",
+    4: "Subcortical Lobe",
+    5: "Temporal"
 }
 
 # -------------- 分析函数 -------------- #
-def analyze_spatial_perturbations(model, data_loader, output_dir, anatomical_labels=ANATOMICAL_LABELS):
+def analyze_feature_perturbations(model, data_loader, output_dir, anatomical_labels=ANATOMICAL_LABELS):
     """
-    研究空间扰动 (Δ_j)
-    - 计算并可视化 ||Δ_j|| 在各脑区的分布
-    - 分析ASD和HC组间脑区扰动差异
-    - 生成脑图可视化不同脑区的扰动范数
+    研究特征扰动 (Δh_j)
+    - 计算Δh_j = Δ_j * x (原特征与扰动的交互)
+    - 分析不同脑区特征变化的模式
+    - 比较ASD和HC组在特征扰动上的差异
     """
-    print("开始分析空间扰动 (Δ_j)...")
+    print("开始分析特征扰动 (Δh_j)...")
     ensure_dir(output_dir)
     device = get_device()
     model.to(device)
     model.eval()
 
     # 创建存储结构，按类别分开存储
-    delta_j_data = {0: [], 1: []}  # 假设二分类问题：0=HC, 1=ASD
-    all_delta_j_magnitudes = []
-    all_anatomical_classes = []
-    all_labels = []
+    delta_h_data = {0: [], 1: []}  # 0=HC, 1=ASD
+    feature_contributions = {0: {}, 1: {}}  # 记录每个特征的贡献
     
-    # 记录每个类别的前10个扰动最大的节点
-    top_nodes = {0: [], 1: []}
-
-    # 将数据加载器数据转为列表以便随机抽样
+    # 从每个类别随机选择样本
     all_data = list(data_loader)
-    
-    # 从每个类别随机选择一个样本
-    selected_samples = {0: None, 1: None}
-    
-    # 首先将数据按类别分组
     class_grouped_data = {0: [], 1: []}
     for batch in all_data:
         for i in range(len(batch.y)):
-            # 抽取单个样本
             single_data = batch[i]
             label = single_data.y.item()-1
             class_grouped_data[label].append(single_data)
     
     # 从每个类别随机选择一个样本
+    selected_samples = {0: None, 1: None}
     for label in [0, 1]:
         if class_grouped_data[label]:
             selected_samples[label] = random.choice(class_grouped_data[label])
             print(f"已为类别 {label} 随机选择样本")
     
-    # 设置绘图风格
-    plt.style.use('seaborn-v0_8-whitegrid')
-    plt.rcParams.update({
-        'font.family': 'Times New Roman',
-        'font.size': 12,
-        'axes.titlesize': 16,
-        'axes.labelsize': 14,
-        'xtick.labelsize': 12,
-        'ytick.labelsize': 12,
-        'legend.fontsize': 12,
-        'figure.titlesize': 18
-    })
-    
     with torch.no_grad():
         # 分析随机选择的样本
         for label, sample in selected_samples.items():
             if sample is None:
-                print(f"警告: 未找到类别 {label} 的样本")
                 continue
                 
-            print(f"分析类别 {label} 的样本")
+            print(f"分析类别 {label} 的样本特征扰动")
             
             sample = sample.to(device)
             
             try:
-                # 从模型前向传播中提取/重新计算 Δ_j
+                # 获取原始特征和其他数据
                 x_orig, edge_index, edge_attr, batch_idx, coords, anatomical_class_batch = \
                     sample.x, sample.edge_index, sample.edge_attr, sample.batch, sample.coords, sample.anatomical_class
                 
@@ -116,6 +92,7 @@ def analyze_spatial_perturbations(model, data_loader, output_dir, anatomical_lab
                 if batch_idx is None:
                     batch_idx = torch.zeros(sample.num_nodes, dtype=torch.long, device=device)
                 
+                # 计算扰动Δ_j
                 current_edge_attr = edge_attr
                 if current_edge_attr is not None and current_edge_attr.ndim > 1:
                     current_edge_attr = current_edge_attr.squeeze()
@@ -126,6 +103,7 @@ def analyze_spatial_perturbations(model, data_loader, output_dir, anatomical_lab
                                   value=current_edge_attr,
                                   sparse_sizes=(sample.num_nodes, sample.num_nodes)).to(device)
 
+                # 获取B_k和计算Δ_j
                 B_k_raw = model.B_k(anatomical_class_batch)
                 B_k_matrix = B_k_raw.view(-1, model.hidden_channels, model.hidden_channels)
 
@@ -134,283 +112,249 @@ def analyze_spatial_perturbations(model, data_loader, output_dir, anatomical_lab
                 Ae_j = Ae_j.unsqueeze(1)
                 delta_j = torch.bmm(Ae_j, B_k_matrix.transpose(1, 2)).squeeze(1)
                 
-                # 计算范数
-                delta_j_magnitudes = torch.norm(delta_j, p=2, dim=1).cpu().numpy()
+                # 获取第一层卷积后的节点表示
+                # 对原始特征应用GATv2卷积
+                x_conv = model.conv1(x_orig, edge_index)
+                x_conv = model.norm1(x_conv, batch_idx)
+                x_conv = F.elu(x_conv)
                 
-                # 保存数据用于后续分析
-                delta_j_data[label].append({
-                    'magnitudes': delta_j_magnitudes,
-                    'anatomical_classes': anatomical_class_batch.cpu().numpy()
+                # 计算特征扰动：Δh_j = Δ_j * x_conv
+                # 1. 计算扰动权重
+                delta_weights = delta_j  # [N, hidden_channels]
+                
+                # 2. 计算特征扰动
+                delta_h_j = delta_weights * x_conv  # 逐元素相乘: [N, hidden_channels]
+                
+                # 3. 计算扰动对原特征的相对影响
+                relative_impact = torch.abs(delta_h_j) / (torch.abs(x_conv) + 1e-8)  # 防止除零
+                
+                # 将结果转换为numpy数组
+                delta_h_j_np = delta_h_j.cpu().numpy()
+                x_conv_np = x_conv.cpu().numpy()
+                relative_impact_np = relative_impact.cpu().numpy()
+                anatomical_classes_np = anatomical_class_batch.cpu().numpy()
+                
+                # 保存结果
+                delta_h_data[label].append({
+                    'delta_h_j': delta_h_j_np,
+                    'original_features': x_conv_np,
+                    'relative_impact': relative_impact_np,
+                    'anatomical_classes': anatomical_classes_np
                 })
                 
-                # 找出扰动范数最大的前10个节点
-                top_indices = np.argsort(delta_j_magnitudes)[-10:][::-1]
-                top_nodes[label] = [{'index': int(idx), 
-                                     'magnitude': float(delta_j_magnitudes[idx]), 
-                                     'anatomical_class': int(anatomical_class_batch[idx].cpu().numpy())} 
-                                    for idx in top_indices]
+                # 分析每个特征维度的贡献
+                feature_dims = delta_h_j.shape[1]
+                for dim in range(feature_dims):
+                    # 按解剖区域分组分析特征维度
+                    for anat_class in np.unique(anatomical_classes_np):
+                        class_mask = anatomical_classes_np == anat_class
+                        
+                        # 计算该特征维度在该解剖区域的平均扰动
+                        mean_impact = np.mean(np.abs(delta_h_j_np[class_mask, dim]))
+                        
+                        # 记录特征贡献
+                        if anat_class not in feature_contributions[label]:
+                            feature_contributions[label][anat_class] = np.zeros(feature_dims)
+                        
+                        feature_contributions[label][anat_class][dim] = mean_impact
                 
-                # 按解剖学类别分组可视化
-                unique_classes = np.unique(anatomical_class_batch.cpu().numpy())
-                magnitudes_by_class = {}
-                for cls in unique_classes:
-                    indices = np.where(anatomical_class_batch.cpu().numpy() == cls)[0]
-                    magnitudes_by_class[cls] = delta_j_magnitudes[indices]
+                # 可视化每个解剖区域的特征扰动模式
+                unique_classes = np.unique(anatomical_classes_np)
                 
-                # 解剖学类别的扰动分布 - 更美观的箱线图
-                fig, ax = plt.subplots(figsize=(14, 8))
+                # 1. 解剖区域的平均特征扰动热力图
+                fig, axes = plt.subplots(len(unique_classes), 1, figsize=(12, 4*len(unique_classes)), dpi=120)
+                if len(unique_classes) == 1:
+                    axes = [axes]
                 
-                box_data = [magnitudes_by_class[cls] for cls in unique_classes]
-                box_labels = [anatomical_labels.get(cls, f"Class {cls}") for cls in unique_classes]
-                
-                # 使用更好的配色方案
-                colors = plt.cm.viridis(np.linspace(0, 0.8, len(unique_classes)))
-                bp = ax.boxplot(box_data, labels=box_labels, patch_artist=True, 
-                                boxprops=dict(alpha=0.8), 
-                                medianprops=dict(color='red'))
-                
-                # 美化箱线图
-                for patch, color in zip(bp['boxes'], colors):
-                    patch.set_facecolor(color)
-                    patch.set_edgecolor('black')
-                    patch.set_linewidth(1.5)
-                
-                ax.set_title(f"Spatial Perturbation by Anatomical Region ({'ASD' if label == 1 else 'HC'})")
-                ax.set_ylabel("||Δ_j||")
-                ax.set_xlabel("Anatomical Region")
-                plt.xticks(rotation=30, ha="right")
-                plt.grid(axis='y', linestyle='--', alpha=0.7)
+                for i, anat_class in enumerate(unique_classes):
+                    class_mask = anatomical_classes_np == anat_class
+                    if np.sum(class_mask) == 0:
+                        continue
+                        
+                    # 计算该解剖区域的平均特征扰动
+                    mean_delta_h = np.mean(np.abs(delta_h_j_np[class_mask]), axis=0)
+                    
+                    # 绘制热力图
+                    im = axes[i].imshow(mean_delta_h.reshape(1, -1), cmap='viridis', aspect='auto')
+                    axes[i].set_title(f"{anatomical_labels.get(anat_class, f'Class {anat_class}')} - Mean Feature Perturbation")
+                    axes[i].set_xlabel("Feature Dimension")
+                    axes[i].set_yticks([])
+                    
+                    # 添加颜色条
+                    plt.colorbar(im, ax=axes[i])
                 
                 plt.tight_layout()
-                save_figure(fig, os.path.join(output_dir, f"spatial_perturbation_by_anatomy_class_{label}.png"))
+                save_figure(fig, os.path.join(output_dir, f"feature_perturbation_heatmap_class_{label}.png"))
                 
-                # 记录所有数据用于组间比较
-                all_delta_j_magnitudes.extend(delta_j_magnitudes)
-                all_anatomical_classes.extend(anatomical_class_batch.cpu().numpy())
-                all_labels.extend([label] * len(delta_j_magnitudes))
+                # 2. 特征扰动的主成分分析 (PCA)
+                if delta_h_j_np.shape[0] > 2:  # 需要至少3个样本
+                    from sklearn.decomposition import PCA
+                    
+                    # 对特征扰动应用PCA
+                    pca = PCA(n_components=2)
+                    delta_h_pca = pca.fit_transform(delta_h_j_np)
+                    
+                    # 绘制PCA散点图，按解剖区域着色
+                    fig, ax = plt.subplots(figsize=(10, 8), dpi=120)
+                    
+                    for anat_class in unique_classes:
+                        class_mask = anatomical_classes_np == anat_class
+                        if np.sum(class_mask) < 2:  # 需要至少2个点才能绘制
+                            continue
+                            
+                        ax.scatter(
+                            delta_h_pca[class_mask, 0], 
+                            delta_h_pca[class_mask, 1],
+                            label=anatomical_labels.get(anat_class, f'Class {anat_class}'),
+                            alpha=0.7,
+                            s=50
+                        )
+                    
+                    ax.set_title(f"PCA of Feature Perturbations ({'ASD' if label == 1 else 'HC'})")
+                    ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)")
+                    ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)")
+                    ax.legend()
+                    ax.grid(alpha=0.3)
+                    
+                    plt.tight_layout()
+                    save_figure(fig, os.path.join(output_dir, f"feature_perturbation_pca_class_{label}.png"))
                 
-                print(f"完成类别 {label} 的样本分析")
+                # 3. 相对影响分析 - 哪些特征受扰动影响最大
+                mean_relative_impact = np.mean(relative_impact_np, axis=0)
+                
+                # 排序并找出最受影响的特征
+                top_features_idx = np.argsort(mean_relative_impact)[::-1][:10]  # 前10个最受影响的特征
+                
+                fig, ax = plt.subplots(figsize=(12, 6), dpi=120)
+                ax.bar(
+                    np.arange(len(top_features_idx)),
+                    mean_relative_impact[top_features_idx],
+                    color='skyblue',
+                    edgecolor='navy'
+                )
+                ax.set_title(f"Top 10 Most Affected Features ({'ASD' if label == 1 else 'HC'})")
+                ax.set_xlabel("Feature Index")
+                ax.set_ylabel("Mean Relative Impact")
+                ax.set_xticks(np.arange(len(top_features_idx)))
+                ax.set_xticklabels([str(idx) for idx in top_features_idx])
+                ax.grid(axis='y', alpha=0.3)
+                
+                plt.tight_layout()
+                save_figure(fig, os.path.join(output_dir, f"top_affected_features_class_{label}.png"))
                 
             except Exception as e:
                 print(f"警告: 分析类别 {label} 的样本时出错: {e}")
-                traceback.print_exc()  # 打印完整的异常堆栈
+                traceback.print_exc()
         
-        # 保存每个类别前10个扰动最大的节点
-        for label in [0, 1]:
-            df = pd.DataFrame(top_nodes[label])
-            df['region_name'] = df['anatomical_class'].apply(lambda x: anatomical_labels.get(x, f"Class {x}"))
-            df.to_csv(os.path.join(output_dir, f"top10_perturbed_nodes_class_{label}.csv"), index=False)
-            
-        # 找出两个类别前10名节点的交集
-        if top_nodes[0] and top_nodes[1]:
-            nodes_hc = set([node['index'] for node in top_nodes[0]])
-            nodes_asd = set([node['index'] for node in top_nodes[1]])
-            common_nodes = nodes_hc.intersection(nodes_asd)
-            
-            if common_nodes:
-                # 保存交集节点
-                common_data = []
-                for node_idx in common_nodes:
-                    hc_mag = next(node['magnitude'] for node in top_nodes[0] if node['index'] == node_idx)
-                    asd_mag = next(node['magnitude'] for node in top_nodes[1] if node['index'] == node_idx)
-                    anat_class = next(node['anatomical_class'] for node in top_nodes[0] if node['index'] == node_idx)
-                    common_data.append({
-                        'node_index': node_idx,
-                        'hc_magnitude': hc_mag,
-                        'asd_magnitude': asd_mag,
-                        'difference': asd_mag - hc_mag,
-                        'percent_diff': ((asd_mag - hc_mag) / hc_mag * 100) if hc_mag != 0 else float('inf'),
-                        'anatomical_class': anat_class,
-                        'region_name': anatomical_labels.get(anat_class, f"Class {anat_class}")
-                    })
-                
-                # 保存交集数据
-                df_common = pd.DataFrame(common_data)
-                df_common.to_csv(os.path.join(output_dir, "common_top_perturbed_nodes.csv"), index=False)
-        
-        # 如果有足够的样本数据进行组间比较
-        if delta_j_data[0] and delta_j_data[1]:
+        # 对比ASD和HC的特征扰动模式
+        if delta_h_data[0] and delta_h_data[1]:
             try:
-                # 将数据转换为数组以便进行组间比较
-                all_delta_j_magnitudes = np.array(all_delta_j_magnitudes)
-                all_anatomical_classes = np.array(all_anatomical_classes)
-                all_labels = np.array(all_labels)
+                # 分析共有的解剖区域
+                common_anat_classes = set(feature_contributions[0].keys()) & set(feature_contributions[1].keys())
                 
-                # 组间比较：对每个解剖类别，比较ASD和HC的扰动分布
-                unique_anatomical_classes = np.unique(all_anatomical_classes)
-                
-                # 创建组间比较表格
-                comparison_data = []
-                for cls in unique_anatomical_classes:
-                    cls_indices = np.where(all_anatomical_classes == cls)[0]
-                    hc_indices = np.where(np.logical_and(all_anatomical_classes == cls, np.array(all_labels) == 0))[0]
-                    asd_indices = np.where(np.logical_and(all_anatomical_classes == cls, np.array(all_labels) == 1))[0]
+                for anat_class in common_anat_classes:
+                    hc_contribution = feature_contributions[0][anat_class]
+                    asd_contribution = feature_contributions[1][anat_class]
                     
-                    if len(hc_indices) > 0 and len(asd_indices) > 0:
-                        hc_mean = np.mean(all_delta_j_magnitudes[hc_indices])
-                        asd_mean = np.mean(all_delta_j_magnitudes[asd_indices])
-                        mean_diff = asd_mean - hc_mean
-                        
-                        # 计算差异百分比
-                        if hc_mean != 0:
-                            percent_diff = (mean_diff / hc_mean) * 100
-                        else:
-                            percent_diff = float('inf') if mean_diff > 0 else float('-inf')
-                        
-                        # 收集用于箱线图的数据
-                        hc_values = all_delta_j_magnitudes[hc_indices]
-                        asd_values = all_delta_j_magnitudes[asd_indices]
-                        
-                        comparison_data.append({
-                            'anatomical_class': cls,
-                            'region_name': anatomical_labels.get(cls, f"Class {cls}"),
-                            'hc_mean': hc_mean,
-                            'asd_mean': asd_mean,
-                            'hc_values': hc_values,
-                            'asd_values': asd_values,
-                            'mean_diff': mean_diff,
-                            'percent_diff': percent_diff
-                        })
-                
-                # 按差异大小排序
-                comparison_data.sort(key=lambda x: abs(x['mean_diff']), reverse=True)
-                
-                # 可视化前N个差异最大的区域
-                top_n = min(10, len(comparison_data))
-                top_diffs = comparison_data[:top_n]
-                
-                # 创建HC vs ASD扰动差异的高质量柱状图
-                fig, ax = plt.subplots(figsize=(12, 8), dpi=150)
-                x = np.arange(top_n)
-                width = 0.35
-                
-                # 绘制ASD和HC的柱状图，使用更好的颜色
-                rects1 = ax.bar(x - width/2, [d['hc_mean'] for d in top_diffs], width, 
-                               label='HC', color='#3498db', alpha=0.85, edgecolor='black', linewidth=1)
-                rects2 = ax.bar(x + width/2, [d['asd_mean'] for d in top_diffs], width, 
-                               label='ASD', color='#e74c3c', alpha=0.85, edgecolor='black', linewidth=1)
-                
-                ax.set_ylabel('Mean ||Δ_j||', fontweight='bold')
-                ax.set_title('Brain Regions with Largest Perturbation Difference', fontweight='bold')
-                ax.set_xticks(x)
-                ax.set_xticklabels([d['region_name'] for d in top_diffs], rotation=30, ha='right')
-                ax.legend(frameon=True, facecolor='white', edgecolor='gray')
-                
-                plt.grid(axis='y', linestyle='--', alpha=0.3)
-                plt.tight_layout()
-                save_figure(fig, os.path.join(output_dir, "hc_vs_asd_perturbation_differences.png"))
-                
-                # 创建差异百分比的条形图 - 更美观的版本
-                fig, ax = plt.subplots(figsize=(12, 8), dpi=150)
-                
-                # 使用渐变色而不是简单的红蓝
-                norm = plt.Normalize(min([d['percent_diff'] for d in top_diffs]), 
-                                     max([d['percent_diff'] for d in top_diffs]))
-                colors = plt.cm.RdBu_r(norm([d['percent_diff'] for d in top_diffs]))
-                
-                bars = ax.bar(x, [d['percent_diff'] for d in top_diffs], color=colors, 
-                             edgecolor='black', linewidth=1)
-                
-                ax.set_ylabel('Percent Difference (%)', fontweight='bold')
-                ax.set_title('Perturbation Difference Between ASD and HC', fontweight='bold')
-                ax.set_xticks(x)
-                ax.set_xticklabels([d['region_name'] for d in top_diffs], rotation=30, ha='right')
-                
-                # 添加水平线表示零差异
-                ax.axhline(y=0, color='k', linestyle='-', alpha=0.3)
-                plt.grid(axis='y', linestyle='--', alpha=0.3)
-                
-                plt.tight_layout()
-                save_figure(fig, os.path.join(output_dir, "perturbation_percent_differences.png"))
-                
-                # 添加ASD-HC扰动范数差异分布的箱线图
-                fig, ax = plt.subplots(figsize=(14, 8), dpi=150)
-                
-                # 计算每个解剖区域的差异
-                diff_data = []
-                diff_labels = []
-                
-                for d in comparison_data:
-                    if len(d['hc_values']) > 0 and len(d['asd_values']) > 0:
-                        # 计算差异向量 - 需要处理长度不同的情况
-                        hc_vals = d['hc_values']
-                        asd_vals = d['asd_values']
-                        
-                        # 使用较短的长度
-                        min_len = min(len(hc_vals), len(asd_vals))
-                        diffs = asd_vals[:min_len] - hc_vals[:min_len]
-                        
-                        diff_data.append(diffs)
-                        diff_labels.append(d['region_name'])
-                
-                if diff_data:
-                    # 按中位数差异排序
-                    median_diffs = [np.median(d) for d in diff_data]
-                    sorted_indices = np.argsort(median_diffs)[::-1]
+                    # 计算差异
+                    diff_contribution = asd_contribution - hc_contribution
                     
-                    sorted_diff_data = [diff_data[i] for i in sorted_indices]
-                    sorted_diff_labels = [diff_labels[i] for i in sorted_indices]
+                    # 找出差异最大的特征
+                    top_diff_idx = np.argsort(np.abs(diff_contribution))[::-1][:20]  # 前20个差异最大的特征
                     
-                    # 选择前10个最大差异的区域
-                    plot_n = min(10, len(sorted_diff_data))
-                    plot_data = sorted_diff_data[:plot_n]
-                    plot_labels = sorted_diff_labels[:plot_n]
+                    # 绘制差异条形图
+                    fig, ax = plt.subplots(figsize=(14, 8), dpi=120)
                     
-                    # 使用更好的配色方案
-                    bp_colors = plt.cm.viridis(np.linspace(0, 0.8, plot_n))
-                    bp = ax.boxplot(plot_data, labels=plot_labels, patch_artist=True,
-                                    boxprops=dict(alpha=0.8),
-                                    medianprops=dict(color='red', linewidth=1.5))
+                    x = np.arange(len(top_diff_idx))
+                    width = 0.35
                     
-                    # 美化箱线图
-                    for patch, color in zip(bp['boxes'], bp_colors):
-                        patch.set_facecolor(color)
-                        patch.set_edgecolor('black')
-                        patch.set_linewidth(1.5)
+                    ax.bar(x - width/2, hc_contribution[top_diff_idx], width, label='HC', color='#3498db', alpha=0.7, edgecolor='black')
+                    ax.bar(x + width/2, asd_contribution[top_diff_idx], width, label='ASD', color='#e74c3c', alpha=0.7, edgecolor='black')
                     
-                    ax.set_title('ASD-HC Perturbation Magnitude Differences by Region', fontweight='bold')
-                    ax.set_ylabel('Δ||Δ_j|| (ASD - HC)', fontweight='bold')
-                    ax.set_xlabel('Anatomical Region', fontweight='bold')
-                    plt.xticks(rotation=30, ha='right')
-                    plt.grid(axis='y', linestyle='--', alpha=0.7)
+                    # 绘制差异线
+                    for i, idx in enumerate(top_diff_idx):
+                        ax.plot([i-width/2, i+width/2], [hc_contribution[idx], asd_contribution[idx]], 'k-', alpha=0.5)
                     
-                    # 添加零线
-                    ax.axhline(y=0, color='k', linestyle='-', alpha=0.5)
+                    ax.set_title(f"ASD vs HC Feature Perturbation - {anatomical_labels.get(anat_class, f'Class {anat_class}')}")
+                    ax.set_xlabel("Feature Index")
+                    ax.set_ylabel("Mean Feature Perturbation")
+                    ax.set_xticks(x)
+                    ax.set_xticklabels([str(idx) for idx in top_diff_idx])
+                    ax.legend()
+                    ax.grid(axis='y', alpha=0.3)
                     
                     plt.tight_layout()
-                    save_figure(fig, os.path.join(output_dir, "asd_hc_perturbation_difference_boxplot.png"))
-                
-                # 保存详细的比较数据到CSV
-                df = pd.DataFrame([{k: v for k, v in d.items() if k not in ['hc_values', 'asd_values']} 
-                                  for d in comparison_data])
-                df.to_csv(os.path.join(output_dir, "perturbation_comparison_by_region.csv"), index=False)
+                    save_figure(fig, os.path.join(output_dir, f"asd_vs_hc_feature_diff_region_{anat_class}.png"))
                     
+                # 创建所有解剖区域的热力图比较
+                all_regions = sorted(list(common_anat_classes))
+                feature_dims = next(iter(feature_contributions[0].values())).shape[0]
+                
+                # 准备热力图数据
+                hc_heatmap = np.zeros((len(all_regions), feature_dims))
+                asd_heatmap = np.zeros((len(all_regions), feature_dims))
+                diff_heatmap = np.zeros((len(all_regions), feature_dims))
+                
+                for i, anat_class in enumerate(all_regions):
+                    hc_heatmap[i] = feature_contributions[0][anat_class]
+                    asd_heatmap[i] = feature_contributions[1][anat_class]
+                    diff_heatmap[i] = asd_heatmap[i] - hc_heatmap[i]
+                
+                # 绘制热力图
+                fig, axes = plt.subplots(3, 1, figsize=(14, 18), dpi=120)
+                
+                # HC热力图
+                im0 = axes[0].imshow(hc_heatmap, cmap='viridis', aspect='auto')
+                axes[0].set_title("HC - Feature Perturbation by Brain Region")
+                axes[0].set_ylabel("Brain Region")
+                axes[0].set_yticks(np.arange(len(all_regions)))
+                axes[0].set_yticklabels([anatomical_labels.get(r, f'Class {r}') for r in all_regions])
+                plt.colorbar(im0, ax=axes[0])
+                
+                # ASD热力图
+                im1 = axes[1].imshow(asd_heatmap, cmap='viridis', aspect='auto')
+                axes[1].set_title("ASD - Feature Perturbation by Brain Region")
+                axes[1].set_ylabel("Brain Region")
+                axes[1].set_yticks(np.arange(len(all_regions)))
+                axes[1].set_yticklabels([anatomical_labels.get(r, f'Class {r}') for r in all_regions])
+                plt.colorbar(im1, ax=axes[1])
+                
+                # 差异热力图
+                im2 = axes[2].imshow(diff_heatmap, cmap='RdBu_r', aspect='auto')
+                axes[2].set_title("ASD - HC Difference in Feature Perturbation")
+                axes[2].set_xlabel("Feature Dimension")
+                axes[2].set_ylabel("Brain Region")
+                axes[2].set_yticks(np.arange(len(all_regions)))
+                axes[2].set_yticklabels([anatomical_labels.get(r, f'Class {r}') for r in all_regions])
+                plt.colorbar(im2, ax=axes[2])
+                
+                plt.tight_layout()
+                save_figure(fig, os.path.join(output_dir, "feature_perturbation_comparison_heatmap.png"))
+                
             except Exception as e:
-                print(f"进行组间比较分析时出错: {e}")
+                print(f"比较ASD和HC特征扰动时出错: {e}")
                 traceback.print_exc()
     
-    print("空间扰动分析完成。")
+    print("特征扰动分析完成。")
 
 
-# 在主函数中只调用空间扰动分析
+# 更新主函数以包含新的特征扰动分析
 def run_msmegat_interpretability_analysis(
-    model_path,             # 路径: 已训练模型的 .pth 文件
-    data_loader,            # PyG DataLoader: 用于分析的数据 (通常是测试集)
-    output_base_dir,        # 路径: 保存分析结果的目录
-    # --- 模型构建所需的核心参数 ---
-    num_node_features,      # int: 节点特征维度
-    num_classes,            # int: 输出类别数
-    hidden_channels,        # int: 隐藏层维度
-    heads,                  # int: GATv2注意力头数
-    num_anatomical_classes, # int: 解剖类别数量
-    # --- 可选参数 ---
+    model_path,
+    data_loader,
+    output_base_dir,
+    num_node_features,
+    num_classes,
+    hidden_channels,
+    heads,
+    num_anatomical_classes,
     anatomical_labels_map=ANATOMICAL_LABELS
 ):
     """
     主函数，用于运行MSMEGAT模型的可解释性分析。
-    专注于空间扰动分析。
+    包括空间扰动分析和特征扰动分析。
     """
-    print(f"开始MSMEGAT空间扰动分析，结果将保存在: {output_base_dir}")
+    print(f"开始MSMEGAT模型可解释性分析，结果将保存在: {output_base_dir}")
     device = get_device()
 
     # 1. 构建模型实例
@@ -433,11 +377,15 @@ def run_msmegat_interpretability_analysis(
     model.to(device)
     model.eval()
 
-    # 只执行空间扰动分析
-    analyze_spatial_perturbations(model, data_loader, os.path.join(output_base_dir, "spatial_perturbations_analysis"),
+    # 执行空间扰动分析
+    # analyze_spatial_perturbations(model, data_loader, os.path.join(output_base_dir, "spatial_perturbations_analysis"),
+    #                             anatomical_labels=anatomical_labels_map)
+    
+    # 执行特征扰动分析
+    analyze_feature_perturbations(model, data_loader, os.path.join(output_base_dir, "feature_perturbations_analysis"),
                                  anatomical_labels=anatomical_labels_map)
 
-    print("MSMEGAT空间扰动分析完成。")
+    print("MSMEGAT模型可解释性分析完成。")
 
 
 if __name__ == '__main__':
@@ -445,7 +393,7 @@ if __name__ == '__main__':
 
     # --- 1. 定义您的模型路径和数据加载 ---
     # !! 您需要修改这些路径和参数以匹配您的设置 !!
-    PATH_TO_TRAINED_MODEL = "results/classification:run_20250520_0546/MSMEGAT/best_model.pth" 
+    PATH_TO_TRAINED_MODEL = "results/classification:run_20250527_1842/MSMEGAT/best_model.pth" 
     OUTPUT_DIR_BASE = "vis"
 
     # --- 2. 定义模型构建参数 (必须与训练时一致) ---
